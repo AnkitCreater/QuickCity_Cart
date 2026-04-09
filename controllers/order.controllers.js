@@ -12,20 +12,37 @@ let instance = new RazorPay({
     key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
+const calculateDistanceKm = (lat1, lon1, lat2, lon2) => {
+    if ([lat1, lon1, lat2, lon2].some(v => v == null || isNaN(v))) return 0
+    const toRad = (x) => x * Math.PI / 180
+    const dLat = toRad(lat2 - lat1)
+    const dLon = toRad(lon2 - lon1)
+    const a = Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+    return 6371 * c
+}
+
 export const placeOrder = async (req, res) => {
     try {
         const { cartItems, paymentMethod, deliveryAddress, totalAmount } = req.body
-        if (cartItems.length == 0 || !cartItems) {
+        if (!Array.isArray(cartItems) || cartItems.length === 0) {
             return res.status(400).json({ message: "cart is empty" })
         }
-        if (!deliveryAddress.text || !deliveryAddress.latitude || !deliveryAddress.longitude) {
+        if (!deliveryAddress || !deliveryAddress.text || deliveryAddress.latitude == null || deliveryAddress.longitude == null) {
             return res.status(400).json({ message: "send complete deliveryAddress" })
+        }
+        if (!paymentMethod || !["cod", "online"].includes(paymentMethod)) {
+            return res.status(400).json({ message: "payment method is required" })
+        }
+        if (totalAmount == null || isNaN(totalAmount) || Number(totalAmount) <= 0) {
+            return res.status(400).json({ message: "total amount is invalid" })
         }
 
         const groupItemsByShop = {}
 
         cartItems.forEach(item => {
-            const shopId = item.shop
+            const shopId = item.shop && typeof item.shop === 'object' ? item.shop._id || item.shop.toString() : item.shop
             if (!groupItemsByShop[shopId]) {
                 groupItemsByShop[shopId] = []
             }
@@ -160,7 +177,11 @@ export const verifyPayment = async (req, res) => {
         return res.status(200).json(order)
 
     } catch (error) {
-        return res.status(500).json({ message: `verify payment  error ${error}` })
+        console.error("verifyPayment error:", error)
+        return res.status(500).json({
+            message: "verify payment error",
+            error: error?.message || error?.toString() || "Unknown error"
+        })
     }
 }
 
@@ -418,16 +439,16 @@ export const getCurrentOrder = async (req, res) => {
             })
 
         if (!assignment) {
-            return res.status(400).json({ message: "assignment not found" })
+            return res.status(200).json(null)
         }
         if (!assignment.order) {
-            return res.status(400).json({ message: "order not found" })
+            return res.status(200).json(null)
         }
 
         const shopOrder = assignment.order.shopOrders.find(so => String(so._id) == String(assignment.shopOrderId))
 
         if (!shopOrder) {
-            return res.status(400).json({ message: "shopOrder not found" })
+            return res.status(200).json(null)
         }
 
         let deliveryBoyLocation = { lat: null, lon: null }
@@ -442,18 +463,23 @@ export const getCurrentOrder = async (req, res) => {
             customerLocation.lon = assignment.order.deliveryAddress.longitude
         }
 
+        const estimatedProfit = deliveryBoyLocation.lat != null && deliveryBoyLocation.lon != null && customerLocation.lat != null && customerLocation.lon != null
+            ? Number((calculateDistanceKm(deliveryBoyLocation.lat, deliveryBoyLocation.lon, customerLocation.lat, customerLocation.lon) * 10).toFixed(2))
+            : 0
+
         return res.status(200).json({
             _id: assignment.order._id,
             user: assignment.order.user,
             shopOrder,
             deliveryAddress: assignment.order.deliveryAddress,
             deliveryBoyLocation,
-            customerLocation
+            customerLocation,
+            estimatedProfit
         })
 
 
     } catch (error) {
-
+        return res.status(500).json({ message: `get current order error ${error}` })
     }
 }
 
@@ -516,23 +542,77 @@ export const verifyDeliveryOtp = async (req, res) => {
             return res.status(400).json({ message: "Invalid/Expired Otp" })
         }
 
+        const deliveryBoy = await User.findById(shopOrder.assignedDeliveryBoy)
+        const deliveryBoyCoords = deliveryBoy?.location?.coordinates || []
+        const customerLat = order.deliveryAddress?.latitude
+        const customerLon = order.deliveryAddress?.longitude
+        const distanceKm = (deliveryBoyCoords.length === 2 && customerLat != null && customerLon != null)
+            ? calculateDistanceKm(deliveryBoyCoords[1], deliveryBoyCoords[0], customerLat, customerLon)
+            : 0
+        const profit = Number((distanceKm * 10).toFixed(2))
+
         shopOrder.status = "delivered"
         shopOrder.deliveredAt = Date.now()
+        shopOrder.deliveryDistance = Number(distanceKm.toFixed(2))
+        shopOrder.profit = profit
         await order.save()
+
         await DeliveryAssignment.deleteOne({
             shopOrderId: shopOrder._id,
             order: order._id,
             assignedTo: shopOrder.assignedDeliveryBoy
         })
 
-        return res.status(200).json({ message: "Order Delivered Successfully!" })
+        return res.status(200).json({ message: "Order Delivered Successfully!", profit })
 
     } catch (error) {
         return res.status(500).json({ message: `verify delivery otp error ${error}` })
     }
 }
 
+export const getDeliveryBoyEarnings = async (req, res) => {
+    try {
+        const deliveryBoyId = req.userId
+        const orders = await Order.find({ "shopOrders.assignedDeliveryBoy": deliveryBoyId }).populate("shopOrders.shop", "name").lean()
 
+        let totalEarnings = 0
+        const history = []
 
+        orders.forEach(order => {
+            const totalSubtotals = order.shopOrders.reduce((sum, so) => sum + Number(so.subtotal || 0), 0)
+            const deliveryFee = Math.max(0, Number(order.totalAmount || 0) - totalSubtotals)
+
+            order.shopOrders.forEach(shopOrder => {
+                if (!shopOrder.assignedDeliveryBoy) return
+                if (String(shopOrder.assignedDeliveryBoy) !== String(deliveryBoyId)) return
+                if (shopOrder.status !== "delivered") return
+
+                const profit = typeof shopOrder.profit === 'number'
+                    ? shopOrder.profit
+                    : totalSubtotals > 0
+                        ? Number(((shopOrder.subtotal / totalSubtotals) * deliveryFee).toFixed(2))
+                        : 0
+
+                totalEarnings += profit
+                history.push({
+                    deliveryDistance: shopOrder.deliveryDistance || 0,
+                    orderId: order._id,
+                    shopOrderId: shopOrder._id,
+                    shopName: shopOrder.shop?.name || "",
+                    subtotal: shopOrder.subtotal,
+                    profit,
+                    customerAddress: order.deliveryAddress?.text,
+                    deliveredAt: shopOrder.deliveredAt,
+                })
+            })
+        })
+
+        history.sort((a,b) => new Date(b.deliveredAt) - new Date(a.deliveredAt))
+
+        return res.status(200).json({ totalEarnings: Number(totalEarnings.toFixed(2)), history })
+    } catch (error) {
+        return res.status(500).json({ message: `get delivery boy earnings error ${error}` })
+    }
+}
 
 

@@ -44,6 +44,14 @@ otpExpires:{
         type:Date,
         default:null
     },
+deliveryDistance:{
+        type:Number,
+        default:0
+    },
+profit:{
+        type:Number,
+        default:0
+    },
 deliveredAt:{
     type:Date,
     default:null
